@@ -1,0 +1,37 @@
+import postgres;
+import os;
+import strings;
+native main {
+    let pool: int = postgres.pool_open(os_getenv("DATABASE_URL"), 2);
+    if (pool == 0) { return 1; }
+    let conn: int = postgres.acquire(pool);
+    if (postgres.command(conn, "CREATE TEMP TABLE forge_module_test (value TEXT)") == 0) { return 2; }
+    let args: int = postgres.params();
+    postgres.push(args, "Robert'); DROP TABLE forge_module_test; --");
+    postgres.push_null(args);
+    let result: int = postgres.query(conn, "SELECT $1::text,$2::text", args);
+    if (postgres.ok(result) == 0 || postgres.rows(result) != 1 || postgres.is_null(result, 0, 1) == 0) { return 3; }
+    let value: string = postgres.value(result, 0, 0);
+    if (str_eq(value, "Robert'); DROP TABLE forge_module_test; --") == 0) { return 4; }
+    postgres.clear(result); postgres.params_close(args);
+    if (postgres.begin(conn) == 0) { return 5; }
+    if (postgres.command(conn, "INSERT INTO forge_module_test VALUES('rolled back')") == 0) { return 6; }
+    postgres.release(pool, conn);
+    conn = postgres.acquire(pool);
+    result = postgres.query(conn, "SELECT count(*) FROM forge_module_test", 0);
+    if (postgres.ok(result) == 0 || str_eq(postgres.value(result, 0, 0), "0") == 0) { return 7; }
+    postgres.clear(result);
+    result = postgres.query(conn, "SELECT * FROM missing_forge_module_table", 0);
+    if (postgres.ok(result) != 0 || str_eq(postgres.state(result), "42P01") == 0) { return 8; }
+    postgres.clear(result);
+    if (postgres.command(conn, "SELECT 1") == 0) { return 9; }
+    if (postgres.migration_table(conn) == 0) { return 10; }
+    if (postgres.migrate(conn, 90001, "forge module rollback", "CREATE TABLE forge_failed_migration(id INT); SELECT * FROM missing_forge_module_table") != 0) { return 11; }
+    result = postgres.query(conn, "SELECT count(*) FROM _sqlx_migrations WHERE version=90001", 0);
+    if (postgres.ok(result) == 0 || str_eq(postgres.value(result, 0, 0), "0") == 0) { return 12; }
+    postgres.clear(result);
+    if (postgres.migrate(conn, 90001, "forge module success", "CREATE TABLE forge_success_migration(id INT)") == 0) { return 13; }
+    if (postgres.migrate(conn, 90001, "forge module success", "CREATE TABLE forge_success_migration(id INT)") == 0) { return 14; }
+    postgres.release(pool, conn); postgres.pool_close(pool);
+    println("Forge PostgreSQL integration passed"); return 0;
+}

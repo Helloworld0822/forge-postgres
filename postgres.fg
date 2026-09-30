@@ -1,0 +1,95 @@
+import strings;
+
+extern fn fpg_pool_open(url: string, size: int): int;
+extern fn fpg_acquire(pool: int): int;
+extern fn fpg_release(pool: int, conn: int): int;
+extern fn fpg_pool_close(pool: int): int;
+extern fn fpg_params(): int;
+extern fn fpg_push(params: int, value: string): int;
+extern fn fpg_push_null(params: int): int;
+extern fn fpg_params_close(params: int): int;
+extern fn fpg_query(conn: int, sql: string, params: int): int;
+extern fn fpg_exec(conn: int, sql: string): int;
+extern fn fpg_ok(result: int): int;
+extern fn fpg_rows(result: int): int;
+extern fn fpg_affected(result: int): int;
+extern fn fpg_is_null(result: int, row: int, column: int): int;
+extern fn fpg_value(result: int, row: int, column: int): string;
+extern fn fpg_error(result: int): string;
+extern fn fpg_state(result: int): string;
+extern fn fpg_clear(result: int): int;
+
+fn pool_open(url: string, size: int): int { return fpg_pool_open(url, size); }
+
+fn acquire(pool: int): int { return fpg_acquire(pool); }
+
+fn release(pool: int, conn: int): int { return fpg_release(pool, conn); }
+
+fn pool_close(pool: int): int { return fpg_pool_close(pool); }
+
+fn params(): int { return fpg_params(); }
+
+fn push(params: int, value: string): int { return fpg_push(params, value); }
+
+fn push_null(params: int): int { return fpg_push_null(params); }
+
+fn params_close(params: int): int { return fpg_params_close(params); }
+
+fn query(conn: int, sql: string, params: int): int { return fpg_query(conn, sql, params); }
+
+fn exec(conn: int, sql: string): int { return fpg_exec(conn, sql); }
+
+fn ok(result: int): int { return fpg_ok(result); }
+
+fn rows(result: int): int { return fpg_rows(result); }
+
+fn affected(result: int): int { return fpg_affected(result); }
+
+fn is_null(result: int, row: int, column: int): int { return fpg_is_null(result, row, column); }
+
+fn value(result: int, row: int, column: int): string { return fpg_value(result, row, column); }
+
+fn error(result: int): string { return fpg_error(result); }
+
+fn state(result: int): string { return fpg_state(result); }
+
+fn clear(result: int): int { return fpg_clear(result); }
+
+fn command(conn: int, sql: string): int {
+    let result: int = exec(conn, sql);
+    let success: int = ok(result);
+    clear(result);
+    return success;
+}
+
+fn begin(conn: int): int { return command(conn, "BEGIN"); }
+fn commit(conn: int): int { return command(conn, "COMMIT"); }
+fn rollback(conn: int): int { return command(conn, "ROLLBACK"); }
+
+fn migration_table(conn: int): int {
+    return command(conn, "CREATE TABLE IF NOT EXISTS _sqlx_migrations (version BIGINT PRIMARY KEY, description TEXT NOT NULL, installed_on TIMESTAMPTZ NOT NULL DEFAULT now(), success BOOLEAN NOT NULL, checksum BYTEA NOT NULL, execution_time BIGINT NOT NULL)");
+}
+
+fn migrate(conn: int, version: int, description: string, sql: string): int {
+    if (begin(conn) == 0) { return 0; }
+    if (command(conn, "SELECT pg_advisory_xact_lock(740183)") == 0) { rollback(conn); return 0; }
+    let args: int = params();
+    push(args, str_from_int(version));
+    let existing: int = query(conn, "SELECT success FROM _sqlx_migrations WHERE version=$1::bigint", args);
+    if (ok(existing) == 0) { clear(existing); params_close(args); rollback(conn); return 0; }
+    if (rows(existing) > 0) {
+        let success: string = value(existing, 0, 0);
+        let valid: int = str_eq(success, "t");
+        clear(existing); params_close(args);
+        if (valid == 0) { rollback(conn); return 0; }
+        return commit(conn);
+    }
+    clear(existing);
+    if (command(conn, sql) == 0) { params_close(args); rollback(conn); return 0; }
+    push(args, description);
+    let recorded: int = query(conn, "INSERT INTO _sqlx_migrations(version,description,success,checksum,execution_time) VALUES($1::bigint,$2,true,decode('00','hex'),0)", args);
+    let success: int = ok(recorded);
+    clear(recorded); params_close(args);
+    if (success == 0) { rollback(conn); return 0; }
+    return commit(conn);
+}

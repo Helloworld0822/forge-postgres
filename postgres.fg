@@ -67,7 +67,10 @@ fn commit(conn: int): int { return command(conn, "COMMIT"); }
 fn rollback(conn: int): int { return command(conn, "ROLLBACK"); }
 
 fn migration_table(conn: int): int {
-    return command(conn, "CREATE TABLE IF NOT EXISTS _sqlx_migrations (version BIGINT PRIMARY KEY, description TEXT NOT NULL, installed_on TIMESTAMPTZ NOT NULL DEFAULT now(), success BOOLEAN NOT NULL, checksum BYTEA NOT NULL, execution_time BIGINT NOT NULL)");
+    if (begin(conn) == 0) { return 0; }
+    if (command(conn, "SELECT pg_advisory_xact_lock(740183)") == 0) { rollback(conn); return 0; }
+    if (command(conn, "CREATE TABLE IF NOT EXISTS _sqlx_migrations (version BIGINT PRIMARY KEY, description TEXT NOT NULL, installed_on TIMESTAMPTZ NOT NULL DEFAULT now(), success BOOLEAN NOT NULL, checksum BYTEA NOT NULL, execution_time BIGINT NOT NULL)") == 0) { rollback(conn); return 0; }
+    return commit(conn);
 }
 
 fn migrate(conn: int, version: int, description: string, sql: string): int {

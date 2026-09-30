@@ -1,0 +1,16 @@
+{
+  "name": "forge-postgres",
+  "version": "0.1.0",
+  "description": "Parameterized PostgreSQL queries, connection pools and transactional migrations.",
+  "repository_url": "https://github.com/Helloworld0822/forge-postgres",
+  "module": "postgres.fg",
+  "license": "MIT",
+  "dependencies": {},
+  "native": {
+    "library": "forge_postgres",
+    "cmake_target": "forge_postgres",
+    "pkg_config": [
+      "libpq"
+    ]
+  }
+}

@@ -8,6 +8,7 @@ extern fn fpg_params(): int;
 extern fn fpg_push(params: int, value: string): int;
 extern fn fpg_push_null(params: int): int;
 extern fn fpg_params_close(params: int): int;
+extern fn fpg_query_prepared(conn: int, sql: string, params: int): int;
 extern fn fpg_query(conn: int, sql: string, params: int): int;
 extern fn fpg_exec(conn: int, sql: string): int;
 extern fn fpg_ok(result: int): int;
@@ -36,6 +37,8 @@ fn push_null(params: int): int { return fpg_push_null(params); }
 fn params_close(params: int): int { return fpg_params_close(params); }
 
 fn query(conn: int, sql: string, params: int): int { return fpg_query(conn, sql, params); }
+
+fn query_prepared(conn: int, sql: string, params: int): int { return fpg_query_prepared(conn, sql, params); }
 
 fn exec(conn: int, sql: string): int { return fpg_exec(conn, sql); }
 

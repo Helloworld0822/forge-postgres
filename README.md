@@ -17,6 +17,12 @@ Values from `value` remain valid until `clear`. Always clear results and paramet
 vectors, including failed queries. `exec` is exclusively for trusted SQL such as
 checked-in migrations; never concatenate user values into SQL.
 
+`query_prepared` reuses up to 32 statements per pool connection. SQL over 16 KiB
+and queries after the cache fills use the regular parameterized query path.
+Statements are cleared after connection resets and trusted `DEALLOCATE ALL` or
+`DISCARD ALL` commands. Only SQL plans are cached; parameter values are sent on
+every execution. Use it for stable repeated queries rather than dynamic SQL.
+
 The pool contains at most 64 connections, waits at most 10 seconds for a lease,
 and applies 5-second statement and 3-second lock timeouts. Connection attempts use a fixed 5-second libpq timeout. No database credentials
 are stored in this repository. See the [libpq documentation](https://www.postgresql.org/docs/16/libpq-exec.html).

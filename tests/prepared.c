@@ -71,6 +71,46 @@ int main(void) {
   result = fpg_query_prepared(conn, data_sql, 0); success(result); fpg_clear(result);
   CHECK(prepared_count(conn) == 1);
 
+  /* An application function can emit 26000 even while the outer prepared
+   * statement exists. Repeated failures must not leak server statements. */
+  command(conn, "CREATE TEMP TABLE prepared_counter(n int); INSERT INTO prepared_counter VALUES(0)");
+  command(conn, "CREATE FUNCTION pg_temp.prepared_raise(fail bool) RETURNS int LANGUAGE plpgsql AS $$ BEGIN IF fail THEN RAISE EXCEPTION 'nested failure' USING ERRCODE='26000'; END IF; UPDATE prepared_counter SET n=n+1; RETURN 42; END $$");
+  const char *nested_sql = "SELECT pg_temp.prepared_raise($1::boolean)";
+  int64_t failing_args = fpg_params(); CHECK(failing_args && fpg_push(failing_args, "true"));
+  int64_t count_before = prepared_count(conn);
+  for (int i = 0; i < 100; i++) {
+    result = fpg_query_prepared(conn, nested_sql, failing_args);
+    CHECK(!fpg_ok(result) && strcmp(fpg_state(result), "26000") == 0); fpg_clear(result);
+    CHECK(prepared_count(conn) == count_before + 1);
+  }
+  fpg_params_close(failing_args);
+  int64_t valid_args = fpg_params(); CHECK(valid_args && fpg_push(valid_args, "false"));
+  result = fpg_query_prepared(conn, nested_sql, valid_args);
+  success(result); CHECK(strcmp(fpg_value(result, 0, 0), "42") == 0); fpg_clear(result);
+  result = fpg_query(conn, "SELECT n FROM prepared_counter", 0);
+  success(result); CHECK(strcmp(fpg_value(result, 0, 0), "1") == 0); fpg_clear(result);
+  fpg_params_close(valid_args);
+
+  /* Reset commands are observed even when they are not the last result. */
+  command(conn, "DEALLOCATE ALL; SELECT 1");
+  CHECK(prepared_count(conn) == 0);
+  result = fpg_query_prepared(conn, data_sql, 0); success(result); fpg_clear(result);
+  result = fpg_exec(conn, "DEALLOCATE ALL; SELECT * FROM missing_prepared_table");
+  CHECK(!fpg_ok(result) && strcmp(fpg_state(result), "42P01") == 0); fpg_clear(result);
+  CHECK(prepared_count(conn) == 0);
+  result = fpg_query_prepared(conn, data_sql, 0); success(result); fpg_clear(result);
+
+  /* Wrong-pool release may not roll back a transaction or free its lease. */
+  command(conn, "BEGIN; INSERT INTO prepared_test VALUES('wrong-pool-kept')");
+  CHECK(fpg_release(control_pool, conn) == 0);
+  CHECK(fpg_pool_close(pool) == 0);
+  command(conn, "COMMIT");
+  result = fpg_query(conn, "SELECT count(*) FROM prepared_test WHERE value='wrong-pool-kept'", 0);
+  success(result); CHECK(strcmp(fpg_value(result, 0, 0), "1") == 0); fpg_clear(result);
+  CHECK(fpg_release(pool, conn));
+  CHECK(fpg_release(pool, conn) == 0);
+  conn = fpg_acquire(pool); CHECK(conn);
+
   /* Transaction errors remain aborted until release rolls back. */
   command(conn, "BEGIN");
   result = fpg_query_prepared(conn, "SELECT 1 / $1::int", 0);
@@ -93,6 +133,12 @@ int main(void) {
   result = fpg_query_prepared(conn, oversized, 0); success(result); fpg_clear(result); free(oversized);
   CHECK(prepared_count(conn) == 32);
 
+  /* A denied DISCARD must neither invalidate valid statements nor mask errors. */
+  int64_t before_denied = prepared_count(conn);
+  result = fpg_exec(conn, "DISCARD ALL; SELECT 1");
+  CHECK(!fpg_ok(result) && strcmp(fpg_state(result), "25001") == 0); fpg_clear(result);
+  CHECK(prepared_count(conn) == before_denied);
+  result = fpg_query_prepared(conn, "SELECT 0::int", 0); success(result); fpg_clear(result);
   command(conn, "DISCARD ALL");
   CHECK(prepared_count(conn) == 0);
   result = fpg_query_prepared(conn, "SELECT 42", 0); success(result); fpg_clear(result);
@@ -110,6 +156,13 @@ int main(void) {
   result = fpg_query_prepared(conn, "SELECT 42", 0); success(result);
   CHECK(strcmp(fpg_value(result, 0, 0), "42") == 0); fpg_clear(result);
   CHECK(prepared_count(conn) == 1);
+  /* Unsupported unfinished COPY cannot poison a future lease. */
+  command(conn, "CREATE TEMP TABLE prepared_copy(value text)");
+  result = fpg_exec(conn, "COPY prepared_copy FROM STDIN");
+  CHECK(result && !fpg_ok(result)); fpg_clear(result);
+  CHECK(fpg_release(pool, conn)); conn = fpg_acquire(pool); CHECK(conn);
+  CHECK(prepared_count(conn) == 0);
+  result = fpg_query_prepared(conn, "SELECT 42", 0); success(result); fpg_clear(result);
   CHECK(fpg_release(pool, conn)); CHECK(fpg_release(control_pool, control));
   CHECK(fpg_pool_close(pool)); CHECK(fpg_pool_close(control_pool));
   puts("prepared query integration passed");

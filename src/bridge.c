@@ -1,14 +1,37 @@
 #define _POSIX_C_SOURCE 200809L
 #include "forge_postgres.h"
 #include <errno.h>
+#include <stdio.h>
 #include <libpq-fe.h>
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
+#define PREPARED_LIMIT 32
+#define PREPARED_SQL_LIMIT 16384
+
 typedef struct {
-  PGconn **conns;
+  char *sql;
+  size_t sql_size;
+  int params;
+  int needs_check;
+  char name[48];
+} Prepared;
+typedef struct {
+  PGconn *pg;
+  Prepared prepared[PREPARED_LIMIT];
+} Connection;
+
+static void prepared_forget(Connection *conn) {
+  for (int i = 0; i < PREPARED_LIMIT; i++) {
+    free(conn->prepared[i].sql);
+    conn->prepared[i].sql = NULL;
+  }
+}
+
+typedef struct {
+  Connection **conns;
   unsigned char *busy;
   int size;
   char *url;
@@ -22,6 +45,12 @@ typedef struct {
 } Params;
 #define HANDLE(p) ((int64_t)(intptr_t)(p))
 #define PTR(t, h) ((t *)(intptr_t)(h))
+static PGconn *connect_database(const char *url) {
+  const char *keys[] = {"dbname", "connect_timeout", NULL};
+  const char *values[] = {url, "5", NULL};
+  return PQconnectdbParams(keys, values, 1);
+}
+
 static int configure(PGconn *c) {
   if (!c || PQstatus(c) != CONNECTION_OK)
     return 0;
@@ -40,7 +69,7 @@ int64_t fpg_pool_open(const char *url, int64_t size) {
     return 0;
   p->size = (int)size;
   p->url = strdup(url);
-  p->conns = calloc(size, sizeof(PGconn *));
+  p->conns = calloc(size, sizeof(Connection *));
   p->busy = calloc(size, 1);
   pthread_mutex_init(&p->mutex, NULL);
   pthread_cond_init(&p->changed, NULL);
@@ -49,10 +78,9 @@ int64_t fpg_pool_open(const char *url, int64_t size) {
     return 0;
   }
   for (int i = 0; i < p->size; ++i) {
-    const char *keys[] = {"dbname", "connect_timeout", NULL};
-    const char *values[] = {url, "5", NULL};
-    p->conns[i] = PQconnectdbParams(keys, values, 1);
-    if (!configure(p->conns[i])) {
+    p->conns[i] = calloc(1, sizeof(Connection));
+    if (p->conns[i]) p->conns[i]->pg = connect_database(url);
+    if (!p->conns[i] || !configure(p->conns[i]->pg)) {
       fpg_pool_close(HANDLE(p));
       return 0;
     }
@@ -71,11 +99,17 @@ int64_t fpg_acquire(int64_t h) {
     for (int i = 0; i < p->size; ++i)
       if (!p->busy[i]) {
         p->busy[i] = 1;
-        PGconn *c = p->conns[i];
+        Connection *c = p->conns[i];
         pthread_mutex_unlock(&p->mutex);
-        if (PQstatus(c) != CONNECTION_OK) {
-          PQreset(c);
-          if (!configure(c)) {
+        if (!c->pg || PQstatus(c->pg) != CONNECTION_OK) {
+          /* A reset creates a new server session: none of its named statements
+           * survive. Discard metadata before reconnecting, even if reset fails. */
+          prepared_forget(c);
+          if (c->pg) PQreset(c->pg);
+          else c->pg = connect_database(p->url);
+          if (!configure(c->pg)) {
+            PQfinish(c->pg);
+            c->pg = NULL;
             fpg_release(h, HANDLE(c));
             return 0;
           }
@@ -90,32 +124,63 @@ int64_t fpg_acquire(int64_t h) {
 }
 int64_t fpg_release(int64_t h, int64_t conn) {
   Pool *p = PTR(Pool, h);
-  PGconn *c = PTR(PGconn, conn);
-  if (!p || !c)
-    return 0;
-  if (PQtransactionStatus(c) != PQTRANS_IDLE && PQstatus(c) == CONNECTION_OK) {
-    PGresult *r = PQexec(c, "ROLLBACK");
-    PQclear(r);
+  Connection *c = PTR(Connection, conn);
+  if (!p || !c) return 0;
+  /* Verify ownership before touching libpq. Mark the lease as releasing while
+   * rollback runs outside the pool lock, rejecting duplicate releases. */
+  pthread_mutex_lock(&p->mutex);
+  int slot = -1;
+  for (int i = 0; i < p->size; ++i) {
+    if (p->conns[i] == c && p->busy[i] == 1) {
+      slot = i;
+      p->busy[i] = 2;
+      break;
+    }
+  }
+  pthread_mutex_unlock(&p->mutex);
+  if (slot < 0) return 0;
+  if (c->pg && PQtransactionStatus(c->pg) != PQTRANS_IDLE &&
+      PQstatus(c->pg) == CONNECTION_OK) {
+    int clean = 0;
+    if (PQtransactionStatus(c->pg) != PQTRANS_ACTIVE) {
+      PGresult *r = PQexec(c->pg, "ROLLBACK");
+      clean = r && PQresultStatus(r) == PGRES_COMMAND_OK &&
+              PQtransactionStatus(c->pg) == PQTRANS_IDLE;
+      PQclear(r);
+    }
+    if (!clean) {
+      /* COPY or a protocol failure may prevent rollback. Close this session
+       * rather than lending a dirty connection; acquire will reconnect it. */
+      prepared_forget(c);
+      PQfinish(c->pg);
+      c->pg = NULL;
+    }
   }
   pthread_mutex_lock(&p->mutex);
-  for (int i = 0; i < p->size; ++i)
-    if (p->conns[i] == c) {
-      p->busy[i] = 0;
-      pthread_cond_signal(&p->changed);
-      pthread_mutex_unlock(&p->mutex);
-      return 1;
-    }
+  p->busy[slot] = 0;
+  pthread_cond_signal(&p->changed);
   pthread_mutex_unlock(&p->mutex);
-  return 0;
+  return 1;
 }
+
 int64_t fpg_pool_close(int64_t h) {
   Pool *p = PTR(Pool, h);
   if (!p)
     return 0;
+  pthread_mutex_lock(&p->mutex);
+  if (p->busy) {
+    for (int i = 0; i < p->size; i++) {
+      if (p->busy[i]) { pthread_mutex_unlock(&p->mutex); return 0; }
+    }
+  }
+  pthread_mutex_unlock(&p->mutex);
   if (p->conns)
     for (int i = 0; i < p->size; ++i)
-      if (p->conns[i])
-        PQfinish(p->conns[i]);
+      if (p->conns[i]) {
+        prepared_forget(p->conns[i]);
+        PQfinish(p->conns[i]->pg);
+        free(p->conns[i]);
+      }
   pthread_mutex_destroy(&p->mutex);
   pthread_cond_destroy(&p->changed);
   free(p->conns);
@@ -158,13 +223,101 @@ int64_t fpg_query(int64_t c, const char *sql, int64_t h) {
   Params *p = PTR(Params, h);
   if (!c || !sql)
     return 0;
-  return HANDLE(PQexecParams(PTR(PGconn, c), sql, p ? p->size : 0, NULL,
+  return HANDLE(PQexecParams(PTR(Connection, c)->pg, sql, p ? p->size : 0, NULL,
                              p ? (const char *const *)p->values : NULL, NULL,
                              NULL, 0));
 }
-int64_t fpg_exec(int64_t c, const char *sql) {
-  return c && sql ? HANDLE(PQexec(PTR(PGconn, c), sql)) : 0;
+int64_t fpg_query_prepared(int64_t c, const char *sql, int64_t h) {
+  if (!c || !sql) return 0;
+  Connection *conn = PTR(Connection, c);
+  Params *params = PTR(Params, h);
+  int count = params ? params->size : 0;
+  size_t size = strnlen(sql, PREPARED_SQL_LIMIT + 1);
+  if (size > PREPARED_SQL_LIMIT) return fpg_query(c, sql, h);
+
+  Prepared *entry = NULL, *available = NULL;
+  for (int i = 0; i < PREPARED_LIMIT; i++) {
+    Prepared *candidate = &conn->prepared[i];
+    if (!candidate->sql) {
+      if (!available) available = candidate;
+    } else if (candidate->params == count && candidate->sql_size == size &&
+               strcmp(candidate->sql, sql) == 0) {
+      entry = candidate;
+      break;
+    }
+  }
+  if (!entry) {
+    /* The cache never evicts a live statement. A full cache uses the ordinary
+     * parameterized path, so variable SQL cannot grow server-side state. */
+    if (!available) return fpg_query(c, sql, h);
+    char *copy = strdup(sql);
+    if (!copy) return fpg_query(c, sql, h);
+    snprintf(available->name, sizeof(available->name), "_forge_pg_%d",
+             (int)(available - conn->prepared));
+    PGresult *prepared = PQprepare(conn->pg, available->name, sql, count, NULL);
+    if (!prepared || PQresultStatus(prepared) != PGRES_COMMAND_OK) {
+      free(copy);
+      return HANDLE(prepared);
+    }
+    PQclear(prepared);
+    entry = available;
+    entry->sql = copy;
+    entry->sql_size = size;
+    entry->params = count;
+    entry->needs_check = 0;
+  } else if (entry->needs_check) {
+    /* 26000 may originate inside a trigger/function while this outer statement
+     * still exists. Describe its name on a later request before replacing it;
+     * metadata inspection never executes or replays the application query. */
+    PGresult *described = PQdescribePrepared(conn->pg, entry->name);
+    if (!described) return 0;
+    if (PQresultStatus(described) != PGRES_COMMAND_OK) {
+      const char *state = PQresultErrorField(described, PG_DIAG_SQLSTATE);
+      if (!state || strcmp(state, "26000") != 0) return HANDLE(described);
+      PQclear(described);
+      PGresult *prepared = PQprepare(conn->pg, entry->name, sql, count, NULL);
+      if (!prepared || PQresultStatus(prepared) != PGRES_COMMAND_OK)
+        return HANDLE(prepared);
+      PQclear(prepared);
+    } else PQclear(described);
+    entry->needs_check = 0;
+  }
+  PGresult *result = PQexecPrepared(
+      conn->pg, entry->name, count,
+      params ? (const char *const *)params->values : NULL, NULL, NULL, 0);
+  const char *state = result ? PQresultErrorField(result, PG_DIAG_SQLSTATE) : NULL;
+  if (state && strcmp(state, "26000") == 0) {
+    /* Preserve the slot/name until actual server metadata is checked. Merely
+     * forgetting it could leak live statements if a nested function raised it. */
+    entry->needs_check = 1;
+  }
+  return HANDLE(result);
 }
+
+int64_t fpg_exec(int64_t c, const char *sql) {
+  if (!c || !sql) return 0;
+  Connection *conn = PTR(Connection, c);
+  /* PQexec returns only the final result. Drain every result so a successful
+   * DISCARD/DEALLOCATE ALL earlier in a trusted multi-statement command cannot
+   * leave stale cache metadata, even if a later statement fails. */
+  if (!PQsendQuery(conn->pg, sql))
+    return HANDLE(PQmakeEmptyPGresult(conn->pg, PGRES_FATAL_ERROR));
+  PGresult *last = NULL, *result;
+  while ((result = PQgetResult(conn->pg)) != NULL) {
+    if (PQresultStatus(result) == PGRES_COMMAND_OK) {
+      const char *tag = PQcmdStatus(result);
+      if (strcmp(tag, "DEALLOCATE ALL") == 0 || strcmp(tag, "DISCARD ALL") == 0)
+        prepared_forget(conn);
+    }
+    PQclear(last);
+    last = result;
+    ExecStatusType status = PQresultStatus(result);
+    if (status == PGRES_COPY_IN || status == PGRES_COPY_OUT || status == PGRES_COPY_BOTH)
+      break; /* COPY is unfinished; release closes it if rollback cannot clean it. */
+  }
+  return HANDLE(last);
+}
+
 int64_t fpg_ok(int64_t h) {
   if (!h)
     return 0;

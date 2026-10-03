@@ -9,6 +9,7 @@ int64_t fpg_params(void);
 int64_t fpg_push(int64_t, const char *);
 int64_t fpg_push_null(int64_t);
 int64_t fpg_params_close(int64_t);
+int64_t fpg_query_prepared(int64_t, const char *, int64_t);
 int64_t fpg_query(int64_t, const char *, int64_t);
 int64_t fpg_exec(int64_t, const char *);
 int64_t fpg_ok(int64_t);
